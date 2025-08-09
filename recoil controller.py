@@ -82,8 +82,9 @@ class CompensatorWorker(QThread):
         self._accum_z = 0.0
         self.get_crouch_factor = crouch_factor_getter
         self.preset_lock = Lock()
-        self.shot_fired = False  # Flag to track when a shot is fired
-        self.last_shot_time = 0  # Track time of last shot
+        self.continuous_shooting = False  # Flag to track continuous shooting mode
+        self.last_compensation_time = 0  # Track time of last compensation
+        self.compensation_interval = 0.05  # 50ms interval for compensation
 
     def set_preset(self, preset: Preset):
         with self.preset_lock:
@@ -95,10 +96,12 @@ class CompensatorWorker(QThread):
         if not self.wait(2000):  # Wait up to 2 seconds for thread to finish
             logger.warning("Worker thread did not terminate gracefully")
             
-    def trigger_shot(self):
-        """Called when a shot is fired to apply compensation"""
-        self.shot_fired = True
-        self.last_shot_time = time.time()
+    def set_continuous_shooting(self, enabled: bool):
+        """Set continuous shooting mode on/off"""
+        self.continuous_shooting = enabled
+        if enabled:
+            self.last_compensation_time = time.time()
+        logger.debug(f"Continuous shooting: {enabled}")
 
     def run(self):
         step_sleep = 0.005  # Faster update rate for more responsive compensation
@@ -106,38 +109,41 @@ class CompensatorWorker(QThread):
         try:
             while not self._stop_event.is_set():
                 try:
-                    if self.active_event.is_set() and self.preset and self.shot_fired:
-                        # Apply recoil compensation when a shot is fired
-                        factor = self.get_crouch_factor() if self.crouch_event.is_set() else 1.0
-                        
-                        # Use lock when accessing preset
-                        with self.preset_lock:
-                            # Apply compensation all at once for immediate effect
-                            self._accum_x += self.preset.move_x * factor
-                            self._accum_y += self.preset.move_y * factor
-                            self._accum_z += self.preset.move_z * factor
+                    if self.active_event.is_set() and self.preset and self.continuous_shooting:
+                        current_time = time.time()
+                        # Apply compensation at fixed intervals while shooting continuously
+                        # Also apply immediately when first starting (last_compensation_time is 0 or very recent)
+                        time_since_last = current_time - self.last_compensation_time
+                        if time_since_last >= self.compensation_interval or time_since_last <= 0.001:
+                            factor = self.get_crouch_factor() if self.crouch_event.is_set() else 1.0
+                            
+                            # Use lock when accessing preset
+                            with self.preset_lock:
+                                # Apply compensation for this interval
+                                self._accum_x += self.preset.move_x * factor
+                                self._accum_y += self.preset.move_y * factor
+                                self._accum_z += self.preset.move_z * factor
 
-                        # Extract integer parts to move/scroll
-                        move_x_int = int(self._accum_x)
-                        move_y_int = int(self._accum_y)
-                        move_z_int = int(self._accum_z)
+                            # Extract integer parts to move/scroll
+                            move_x_int = int(self._accum_x)
+                            move_y_int = int(self._accum_y)
+                            move_z_int = int(self._accum_z)
 
-                        # Subtract sent integers from accumulator
-                        self._accum_x -= move_x_int
-                        self._accum_y -= move_y_int
-                        self._accum_z -= move_z_int
+                            # Subtract sent integers from accumulator
+                            self._accum_x -= move_x_int
+                            self._accum_y -= move_y_int
+                            self._accum_z -= move_z_int
 
-                        # Send raw movement deltas so Roblox detects it in mouse lock
-                        if move_x_int != 0 or move_y_int != 0:
-                            move_mouse_raw(move_x_int, move_y_int)
+                            # Send raw movement deltas so Roblox detects it in mouse lock
+                            if move_x_int != 0 or move_y_int != 0:
+                                move_mouse_raw(move_x_int, move_y_int)
 
-                        # Scroll if Z != 0
-                        if move_z_int != 0:
-                            scroll_mouse(move_z_int)
-                        
-                        # Reset shot flag after a short time (allows for rapid fire)
-                        if time.time() - self.last_shot_time > 0.05:
-                            self.shot_fired = False
+                            # Scroll if Z != 0
+                            if move_z_int != 0:
+                                scroll_mouse(move_z_int)
+                            
+                            # Update last compensation time
+                            self.last_compensation_time = current_time
                     
                     time.sleep(step_sleep)
                 except Exception as e:
@@ -493,7 +499,7 @@ class MacroController(QWidget):
         """)
         
         # Message for shot detection
-        self.shot_info = QLabel("Click to fire - compensation applied with each shot")
+        self.shot_info = QLabel("Hold left mouse button for continuous compensation - works for both tap and hold firing")
         self.shot_info.setAlignment(Qt.AlignCenter)
         self.shot_info.setStyleSheet("font-style: italic; color: #AAAAAA;")
         
@@ -659,31 +665,35 @@ class MacroController(QWidget):
         try:
             if button == mouse.Button.left:
                 self.left_pressed = pressed
-                if pressed and self.enable_btn.isChecked():
-                    # Apply compensation on each shot (left click)
-                    self.apply_compensation()
+                if self.enable_btn.isChecked():
+                    if pressed:
+                        # Start continuous compensation when button is pressed
+                        self.start_continuous_compensation()
+                    else:
+                        # Stop continuous compensation when button is released
+                        self.stop_continuous_compensation()
                     
             elif button == mouse.Button.right:
                 self.right_pressed = pressed
                 
             # Update status label
             if self.enable_btn.isChecked():
-                if pressed:
+                if self.left_pressed:
                     self.status_label.setObjectName("statusActive")
-                    self.status_label.setText("Compensation active")
+                    self.status_label.setText("Compensation active (continuous)")
                     self.status_label.style().unpolish(self.status_label)
                     self.status_label.style().polish(self.status_label)
                 else:
                     self.status_label.setObjectName("statusInactive")
-                    self.status_label.setText("Ready (waiting for next shot)")
+                    self.status_label.setText("Ready (waiting for trigger)")
                     self.status_label.style().unpolish(self.status_label)
                     self.status_label.style().polish(self.status_label)
                     
         except Exception as e:
             logger.error(f"Mouse click error: {str(e)}")
             
-    def apply_compensation(self):
-        """Apply recoil compensation for a single shot"""
+    def start_continuous_compensation(self):
+        """Start continuous recoil compensation"""
         try:
             if not self.enable_btn.isChecked():
                 return
@@ -696,10 +706,32 @@ class MacroController(QWidget):
                 move_z=self.move_z_spin.value(),
             )
             
-            # Set active and trigger compensation
+            # Set active and start continuous shooting
             self.worker.set_preset(p)
             self.active_event.set()
-            self.worker.trigger_shot()
+            self.worker.set_continuous_shooting(True)
+            
+        except Exception as e:
+            logger.error(f"Start compensation error: {str(e)}")
+
+    def stop_continuous_compensation(self):
+        """Stop continuous recoil compensation"""
+        try:
+            self.worker.set_continuous_shooting(False)
+            
+        except Exception as e:
+            logger.error(f"Stop compensation error: {str(e)}")
+
+    def apply_compensation(self):
+        """Apply recoil compensation for a single shot (legacy method for compatibility)"""
+        try:
+            if not self.enable_btn.isChecked():
+                return
+                
+            # For backwards compatibility, this now triggers a short burst
+            self.start_continuous_compensation()
+            # Use a timer to stop after a short time for single-shot mode
+            QTimer.singleShot(50, self.stop_continuous_compensation)
             
         except Exception as e:
             logger.error(f"Compensation error: {str(e)}")
