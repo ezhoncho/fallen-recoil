@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QDoubleSpinBox,
     QPushButton, QVBoxLayout, QHBoxLayout, QListWidget, QFrame,
-    QMessageBox, QLineEdit, QFileDialog, QSlider, QGroupBox
+    QMessageBox, QLineEdit, QFileDialog, QSlider, QGroupBox, QComboBox
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
 from PyQt5.QtGui import QPalette, QColor, QFont
@@ -32,6 +32,17 @@ logging.basicConfig(
 logger = logging.getLogger("RecoilController")
 
 PRESET_PATH = os.path.join(os.path.expanduser("~"), ".macro_presets_xyz_roblox.json")
+
+# Gun presets with X, Y, Z compensation values
+GUN_PRESETS = {
+    "Salvaged Scorpion - Light SMG": {"x": 0.2, "y": -1.2, "z": 0.0},
+    "Salvaged SMG - Basic SMG": {"x": 0.1, "y": -0.9, "z": 0.0},
+    "Military M4A1 - Assault rifle": {"x": 0.3, "y": -1.5, "z": 0.0},
+    "Salvaged AK-47 - Heavy assault rifle": {"x": 0.4, "y": -1.8, "z": 0.0},
+    "AK74U - Compact assault rifle": {"x": 0.3, "y": -1.4, "z": 0.0},
+    "PKM - Heavy machine gun": {"x": 0.5, "y": -2.1, "z": 0.0},
+    "Custom": {"x": 0.0, "y": 0.0, "z": 0.0}
+}
 
 # Windows raw delta mouse move
 def move_mouse_raw(dx: int, dy: int):
@@ -277,12 +288,24 @@ class MacroController(QWidget):
                 background-color: #252526;
                 color: #6D6D6D;
             }
-            QLineEdit, QListWidget, QDoubleSpinBox {
+            QLineEdit, QListWidget, QDoubleSpinBox, QComboBox {
                 background-color: #252526;
                 color: #DCDCDC;
                 border: 1px solid #3C3C40;
                 border-radius: 4px;
                 padding: 4px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3C3C40;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #DCDCDC;
+                width: 0;
+                height: 0;
             }
             QSlider::groove:horizontal {
                 background: #252526;
@@ -361,6 +384,21 @@ class MacroController(QWidget):
         main_layout = QVBoxLayout()
         main_layout.setSpacing(15)
         main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Gun Selection dropdown
+        gun_layout = QHBoxLayout()
+        gun_label = QLabel("Gun Selection:")
+        gun_label.setFixedWidth(120)
+        gun_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        
+        self.gun_combo = QComboBox()
+        self.gun_combo.addItems(list(GUN_PRESETS.keys()))
+        self.gun_combo.setCurrentText("Custom")
+        gun_layout.addWidget(gun_label)
+        gun_layout.addWidget(self.gun_combo)
+        gun_layout.addStretch()
+        
+        main_layout.addLayout(gun_layout)
         main_layout.addWidget(header)
         
         # Recoil settings group
@@ -523,6 +561,7 @@ class MacroController(QWidget):
         self.pressed_keys = set()
         self.crouch_key = "ctrl"  # Default
         self.presets: Dict[str, Preset] = {}
+        self.updating_from_gun_preset = False  # Flag to prevent custom switching during gun preset load
         
         # Load presets after UI is ready
         QTimer.singleShot(100, self.initialize_application)
@@ -547,6 +586,71 @@ class MacroController(QWidget):
             self.status_label.setText("Initialization failed!")
             self.status_label.style().unpolish(self.status_label)
             self.status_label.style().polish(self.status_label)
+
+    def on_gun_selection_changed(self, gun_name: str):
+        """Handle gun selection from dropdown"""
+        try:
+            if gun_name in GUN_PRESETS:
+                preset = GUN_PRESETS[gun_name]
+                
+                # Set flag to prevent custom switching during preset load
+                self.updating_from_gun_preset = True
+                
+                # Update spinbox values
+                self.move_x_spin.setValue(preset["x"])
+                self.move_y_spin.setValue(preset["y"])
+                self.move_z_spin.setValue(preset["z"])
+                
+                # Clear flag
+                self.updating_from_gun_preset = False
+                
+                # Update status
+                if gun_name == "Custom":
+                    self.status_label.setText("Custom compensation values")
+                else:
+                    self.status_label.setText(f"Loaded gun preset: {gun_name}")
+                    
+                logger.info(f"Applied gun preset: {gun_name}")
+                
+        except Exception as e:
+            logger.error(f"Error applying gun preset: {str(e)}")
+    
+    def on_compensation_value_changed(self):
+        """Handle manual changes to compensation values"""
+        try:
+            # Don't switch to custom if we're updating from a gun preset
+            if self.updating_from_gun_preset:
+                return
+                
+            # Check if current values match any gun preset
+            current_x = self.move_x_spin.value()
+            current_y = self.move_y_spin.value()
+            current_z = self.move_z_spin.value()
+            
+            # Look for matching preset
+            matching_preset = None
+            for gun_name, preset in GUN_PRESETS.items():
+                if (abs(preset["x"] - current_x) < 0.001 and 
+                    abs(preset["y"] - current_y) < 0.001 and
+                    abs(preset["z"] - current_z) < 0.001):
+                    matching_preset = gun_name
+                    break
+            
+            # Update combo box if needed
+            if matching_preset and self.gun_combo.currentText() != matching_preset:
+                # Temporarily set flag to prevent recursion
+                self.updating_from_gun_preset = True
+                self.gun_combo.setCurrentText(matching_preset)
+                self.updating_from_gun_preset = False
+            elif not matching_preset and self.gun_combo.currentText() != "Custom":
+                # Switch to custom
+                self.updating_from_gun_preset = True
+                self.gun_combo.setCurrentText("Custom")
+                self.status_label.setText("Custom compensation values")
+                self.updating_from_gun_preset = False
+                
+        except Exception as e:
+            logger.error(f"Error handling compensation value change: {str(e)}")
 
     def get_crouch_factor(self) -> float:
         # Return factor from slider percentage (0.0 to 1.0)
@@ -627,10 +731,31 @@ class MacroController(QWidget):
             p = self.presets.get(name)
             if not p:
                 return
-                
+            
+            # Set flag to prevent gun combo switching during preset load
+            self.updating_from_gun_preset = True
+            
             self.move_x_spin.setValue(p.move_x)
             self.move_y_spin.setValue(p.move_y)
             self.move_z_spin.setValue(p.move_z)
+            
+            # Check if loaded values match any gun preset
+            matching_gun = None
+            for gun_name, gun_preset in GUN_PRESETS.items():
+                if (abs(gun_preset["x"] - p.move_x) < 0.001 and 
+                    abs(gun_preset["y"] - p.move_y) < 0.001 and
+                    abs(gun_preset["z"] - p.move_z) < 0.001):
+                    matching_gun = gun_name
+                    break
+            
+            # Update gun combo accordingly
+            if matching_gun:
+                self.gun_combo.setCurrentText(matching_gun)
+            else:
+                self.gun_combo.setCurrentText("Custom")
+            
+            # Clear flag
+            self.updating_from_gun_preset = False
                 
             self.status_label.setText(f"Loaded preset '{name}'")
             logger.info(f"Loaded preset: {name}")
@@ -776,6 +901,14 @@ class MacroController(QWidget):
             self.preset_list.itemDoubleClicked.connect(self.load_selected_preset)
             self.crouch_key_edit.textChanged.connect(self.on_crouch_key_changed)
             self.crouch_slider.valueChanged.connect(self.on_crouch_slider_changed)
+            
+            # Connect gun selection dropdown
+            self.gun_combo.currentTextChanged.connect(self.on_gun_selection_changed)
+            
+            # Connect compensation value change detection
+            self.move_x_spin.valueChanged.connect(self.on_compensation_value_changed)
+            self.move_y_spin.valueChanged.connect(self.on_compensation_value_changed)
+            self.move_z_spin.valueChanged.connect(self.on_compensation_value_changed)
             
             # Connect input listeners
             self.mouse_listener.button_pressed.connect(self.on_mouse_click)
