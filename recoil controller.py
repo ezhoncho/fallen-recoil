@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QDoubleSpinBox,
     QPushButton, QVBoxLayout, QHBoxLayout, QListWidget, QFrame,
-    QMessageBox, QLineEdit, QFileDialog, QSlider, QGroupBox
+    QMessageBox, QLineEdit, QFileDialog, QSlider, QGroupBox, QComboBox
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
 from PyQt5.QtGui import QPalette, QColor, QFont
@@ -32,6 +32,17 @@ logging.basicConfig(
 logger = logging.getLogger("RecoilController")
 
 PRESET_PATH = os.path.join(os.path.expanduser("~"), ".macro_presets_xyz_roblox.json")
+
+# Gun presets for automatic weapons
+GUN_PRESETS = {
+    "Custom": {"x": 0.0, "y": -0.7, "z": 0.0},
+    "Salvaged Scorpion": {"x": 0.2, "y": -1.2, "z": 0.0},
+    "Salvaged SMG": {"x": 0.1, "y": -0.9, "z": 0.0},
+    "Military M4A1": {"x": 0.3, "y": -1.5, "z": 0.0},
+    "Salvaged AK-47": {"x": 0.4, "y": -1.8, "z": 0.0},
+    "AK74U": {"x": 0.3, "y": -1.4, "z": 0.0},
+    "PKM": {"x": 0.5, "y": -2.1, "z": 0.0}
+}
 
 # Windows raw delta mouse move
 def move_mouse_raw(dx: int, dy: int):
@@ -277,12 +288,28 @@ class MacroController(QWidget):
                 background-color: #252526;
                 color: #6D6D6D;
             }
-            QLineEdit, QListWidget, QDoubleSpinBox {
+            QLineEdit, QListWidget, QDoubleSpinBox, QComboBox {
                 background-color: #252526;
                 color: #DCDCDC;
                 border: 1px solid #3C3C40;
                 border-radius: 4px;
                 padding: 4px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #DCDCDC;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #252526;
+                border: 1px solid #3C3C40;
+                selection-background-color: #007ACC;
             }
             QSlider::groove:horizontal {
                 background: #252526;
@@ -362,6 +389,24 @@ class MacroController(QWidget):
         main_layout.setSpacing(15)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.addWidget(header)
+        
+        # Gun selection group
+        gun_group = QGroupBox("Gun Selection")
+        gun_layout = QVBoxLayout()
+        gun_layout.setSpacing(10)
+        
+        gun_select_layout = QHBoxLayout()
+        self.gun_label = QLabel("Select Gun:")
+        self.gun_label.setFixedWidth(200)
+        self.gun_combo = QComboBox()
+        # Populate dropdown with available gun presets
+        self.gun_combo.addItems(list(GUN_PRESETS.keys()))
+        self.gun_combo.setCurrentText("Custom")  # Default to custom settings
+        gun_select_layout.addWidget(self.gun_label)
+        gun_select_layout.addWidget(self.gun_combo)
+        gun_layout.addLayout(gun_select_layout)
+        
+        gun_group.setLayout(gun_layout)
         
         # Recoil settings group
         recoil_group = QGroupBox("Recoil Compensation Settings")
@@ -498,6 +543,7 @@ class MacroController(QWidget):
         self.shot_info.setStyleSheet("font-style: italic; color: #AAAAAA;")
         
         # Add everything to main layout
+        main_layout.addWidget(gun_group)
         main_layout.addWidget(recoil_group)
         main_layout.addWidget(crouch_group)
         main_layout.addWidget(presets_group)
@@ -555,6 +601,34 @@ class MacroController(QWidget):
         except Exception as e:
             logger.error(f"Error getting crouch factor: {str(e)}")
             return 1.0
+
+    def on_gun_selection_changed(self, gun_name: str):
+        """Handle gun selection change and update compensation values"""
+        try:
+            if gun_name in GUN_PRESETS:
+                preset = GUN_PRESETS[gun_name]
+                self.move_x_spin.setValue(preset["x"])
+                self.move_y_spin.setValue(preset["y"])
+                self.move_z_spin.setValue(preset["z"])
+                
+                self.status_label.setText(f"Loaded {gun_name} preset")
+                logger.info(f"Applied {gun_name} preset: X={preset['x']}, Y={preset['y']}, Z={preset['z']}")
+        except Exception as e:
+            logger.error(f"Error applying gun preset: {str(e)}")
+            self.show_error(f"Failed to apply gun preset: {str(e)}")
+
+    def on_compensation_value_changed(self):
+        """Handle manual changes to compensation values - switch to Custom if not already"""
+        try:
+            # If user manually changes values, switch to Custom to indicate they're using custom values
+            if self.gun_combo.currentText() != "Custom":
+                # Temporarily disconnect to avoid recursion
+                self.gun_combo.currentTextChanged.disconnect()
+                self.gun_combo.setCurrentText("Custom")
+                self.gun_combo.currentTextChanged.connect(self.on_gun_selection_changed)
+                self.status_label.setText("Switched to Custom (manual adjustment)")
+        except Exception as e:
+            logger.error(f"Error handling compensation change: {str(e)}")
 
     def on_crouch_slider_changed(self, value: int):
         try:
@@ -776,6 +850,14 @@ class MacroController(QWidget):
             self.preset_list.itemDoubleClicked.connect(self.load_selected_preset)
             self.crouch_key_edit.textChanged.connect(self.on_crouch_key_changed)
             self.crouch_slider.valueChanged.connect(self.on_crouch_slider_changed)
+            
+            # Connect gun selection
+            self.gun_combo.currentTextChanged.connect(self.on_gun_selection_changed)
+            
+            # Connect compensation value changes to detect manual adjustments
+            self.move_x_spin.valueChanged.connect(self.on_compensation_value_changed)
+            self.move_y_spin.valueChanged.connect(self.on_compensation_value_changed)
+            self.move_z_spin.valueChanged.connect(self.on_compensation_value_changed)
             
             # Connect input listeners
             self.mouse_listener.button_pressed.connect(self.on_mouse_click)
