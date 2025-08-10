@@ -82,8 +82,8 @@ class CompensatorWorker(QThread):
         self._accum_z = 0.0
         self.get_crouch_factor = crouch_factor_getter
         self.preset_lock = Lock()
-        self.shot_fired = False  # Flag to track when a shot is fired
-        self.last_shot_time = 0  # Track time of last shot
+        self.left_button_held = False  # Track if left mouse button is held down
+        self.compensation_interval = 0.01  # Configurable interval for auto-compensation (10ms)
 
     def set_preset(self, preset: Preset):
         with self.preset_lock:
@@ -92,27 +92,29 @@ class CompensatorWorker(QThread):
     def stop(self):
         self._stop_event.set()
         self.active_event.clear()
+        self.left_button_held = False  # Reset button state on stop
         if not self.wait(2000):  # Wait up to 2 seconds for thread to finish
             logger.warning("Worker thread did not terminate gracefully")
-            
-    def trigger_shot(self):
-        """Called when a shot is fired to apply compensation"""
-        self.shot_fired = True
-        self.last_shot_time = time.time()
+    def set_left_button_state(self, held: bool):
+        """Set the left mouse button state for continuous compensation"""
+        self.left_button_held = held
+        
+    def set_compensation_interval(self, interval: float):
+        """Set the interval between compensation applications for auto-fire"""
+        self.compensation_interval = max(0.001, min(0.1, interval))  # Clamp between 1ms and 100ms
 
     def run(self):
-        step_sleep = 0.005  # Faster update rate for more responsive compensation
         logger.info("Compensator worker started")
         try:
             while not self._stop_event.is_set():
                 try:
-                    if self.active_event.is_set() and self.preset and self.shot_fired:
-                        # Apply recoil compensation when a shot is fired
+                    if self.active_event.is_set() and self.preset and self.left_button_held:
+                        # Apply continuous recoil compensation while left button is held
                         factor = self.get_crouch_factor() if self.crouch_event.is_set() else 1.0
                         
                         # Use lock when accessing preset
                         with self.preset_lock:
-                            # Apply compensation all at once for immediate effect
+                            # Apply compensation continuously at the set interval
                             self._accum_x += self.preset.move_x * factor
                             self._accum_y += self.preset.move_y * factor
                             self._accum_z += self.preset.move_z * factor
@@ -135,11 +137,12 @@ class CompensatorWorker(QThread):
                         if move_z_int != 0:
                             scroll_mouse(move_z_int)
                         
-                        # Reset shot flag after a short time (allows for rapid fire)
-                        if time.time() - self.last_shot_time > 0.05:
-                            self.shot_fired = False
-                    
-                    time.sleep(step_sleep)
+                        # Use compensation interval for continuous auto-compensation
+                        time.sleep(self.compensation_interval)
+                    else:
+                        # When not compensating, use a longer sleep to reduce CPU usage
+                        time.sleep(0.01)
+                        
                 except Exception as e:
                     logger.error(f"Error in worker loop: {str(e)}")
                     self.error.emit(f"Worker error: {str(e)}")
@@ -410,6 +413,20 @@ class MacroController(QWidget):
         z_layout.addWidget(self.move_z_spin)
         recoil_layout.addLayout(z_layout)
         
+        # Compensation interval
+        interval_layout = QHBoxLayout()
+        self.interval_label = QLabel("Auto-fire Interval (ms):")
+        self.interval_label.setFixedWidth(200)
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(1.0, 100.0)
+        self.interval_spin.setDecimals(1)
+        self.interval_spin.setSingleStep(1.0)
+        self.interval_spin.setValue(10.0)  # Default 10ms for typical auto weapons
+        self.interval_spin.setFixedWidth(120)
+        interval_layout.addWidget(self.interval_label)
+        interval_layout.addWidget(self.interval_spin)
+        recoil_layout.addLayout(interval_layout)
+        
         recoil_group.setLayout(recoil_layout)
         
         # Crouch settings group
@@ -468,7 +485,7 @@ class MacroController(QWidget):
         presets_group.setLayout(presets_layout)
         
         # Enable button
-        self.enable_btn = QPushButton("Enable Recoil Compensation")
+        self.enable_btn = QPushButton("Enable Auto-Compensation")
         self.enable_btn.setCheckable(True)
         self.enable_btn.setChecked(True)
         self.enable_btn.setStyleSheet("""
@@ -492,8 +509,8 @@ class MacroController(QWidget):
             }
         """)
         
-        # Message for shot detection
-        self.shot_info = QLabel("Click to fire - compensation applied with each shot")
+        # Message for auto-compensation behavior
+        self.shot_info = QLabel("Hold left mouse button - continuous auto-compensation while held")
         self.shot_info.setAlignment(Qt.AlignCenter)
         self.shot_info.setStyleSheet("font-style: italic; color: #AAAAAA;")
         
@@ -536,6 +553,11 @@ class MacroController(QWidget):
             self.mouse_listener.start()
             self.keyboard_listener.start()
             self.connect_signals()
+            
+            # Set initial compensation interval
+            initial_interval = self.interval_spin.value() / 1000.0  # Convert ms to seconds
+            self.worker.set_compensation_interval(initial_interval)
+            
             self.status_label.setText("Status: Ready")
             # Set default crouch key
             self.crouch_key = self.crouch_key_edit.text().strip().lower()
@@ -659,31 +681,36 @@ class MacroController(QWidget):
         try:
             if button == mouse.Button.left:
                 self.left_pressed = pressed
-                if pressed and self.enable_btn.isChecked():
-                    # Apply compensation on each shot (left click)
-                    self.apply_compensation()
+                if self.enable_btn.isChecked():
+                    if pressed:
+                        # Start continuous compensation when left button is pressed
+                        self.start_continuous_compensation()
+                    else:
+                        # Stop continuous compensation when left button is released
+                        self.stop_continuous_compensation()
                     
             elif button == mouse.Button.right:
                 self.right_pressed = pressed
                 
             # Update status label
             if self.enable_btn.isChecked():
-                if pressed:
-                    self.status_label.setObjectName("statusActive")
-                    self.status_label.setText("Compensation active")
-                    self.status_label.style().unpolish(self.status_label)
-                    self.status_label.style().polish(self.status_label)
-                else:
-                    self.status_label.setObjectName("statusInactive")
-                    self.status_label.setText("Ready (waiting for next shot)")
-                    self.status_label.style().unpolish(self.status_label)
-                    self.status_label.style().polish(self.status_label)
+                if button == mouse.Button.left:
+                    if pressed:
+                        self.status_label.setObjectName("statusActive")
+                        self.status_label.setText("Auto-compensation active")
+                        self.status_label.style().unpolish(self.status_label)
+                        self.status_label.style().polish(self.status_label)
+                    else:
+                        self.status_label.setObjectName("statusInactive")
+                        self.status_label.setText("Ready (hold left button for auto-compensation)")
+                        self.status_label.style().unpolish(self.status_label)
+                        self.status_label.style().polish(self.status_label)
                     
         except Exception as e:
             logger.error(f"Mouse click error: {str(e)}")
             
-    def apply_compensation(self):
-        """Apply recoil compensation for a single shot"""
+    def start_continuous_compensation(self):
+        """Start continuous recoil compensation while left button is held"""
         try:
             if not self.enable_btn.isChecked():
                 return
@@ -696,13 +723,26 @@ class MacroController(QWidget):
                 move_z=self.move_z_spin.value(),
             )
             
-            # Set active and trigger compensation
+            # Set active and start continuous compensation
             self.worker.set_preset(p)
+            self.worker.set_left_button_state(True)
             self.active_event.set()
-            self.worker.trigger_shot()
             
         except Exception as e:
-            logger.error(f"Compensation error: {str(e)}")
+            logger.error(f"Start compensation error: {str(e)}")
+            
+    def stop_continuous_compensation(self):
+        """Stop continuous recoil compensation"""
+        try:
+            self.worker.set_left_button_state(False)
+            self.active_event.clear()
+            
+        except Exception as e:
+            logger.error(f"Stop compensation error: {str(e)}")
+
+    def apply_compensation(self):
+        """Legacy method - now redirects to continuous compensation for compatibility"""
+        self.start_continuous_compensation()
 
     # ---------- Keyboard Listener ----------
     def on_key_action(self, key, pressed):
@@ -757,14 +797,24 @@ class MacroController(QWidget):
     def on_toggle_enabled(self, enabled: bool):
         try:
             if enabled:
-                self.status_label.setText("Compensation Enabled")
-                self.enable_btn.setText("Disable Compensation")
+                self.status_label.setText("Auto-Compensation Enabled")
+                self.enable_btn.setText("Disable Auto-Compensation")
             else:
-                self.status_label.setText("Compensation Disabled")
-                self.enable_btn.setText("Enable Compensation")
+                self.status_label.setText("Auto-Compensation Disabled")
+                self.enable_btn.setText("Enable Auto-Compensation")
                 self.active_event.clear()
+                self.worker.set_left_button_state(False)
         except Exception as e:
             logger.error(f"Toggle error: {str(e)}")
+
+    def on_interval_changed(self, value: float):
+        """Update the compensation interval when changed"""
+        try:
+            interval_seconds = value / 1000.0  # Convert ms to seconds
+            self.worker.set_compensation_interval(interval_seconds)
+            logger.info(f"Compensation interval set to {value}ms")
+        except Exception as e:
+            logger.error(f"Interval change error: {str(e)}")
 
     def connect_signals(self):
         try:
@@ -776,6 +826,7 @@ class MacroController(QWidget):
             self.preset_list.itemDoubleClicked.connect(self.load_selected_preset)
             self.crouch_key_edit.textChanged.connect(self.on_crouch_key_changed)
             self.crouch_slider.valueChanged.connect(self.on_crouch_slider_changed)
+            self.interval_spin.valueChanged.connect(self.on_interval_changed)
             
             # Connect input listeners
             self.mouse_listener.button_pressed.connect(self.on_mouse_click)
@@ -800,6 +851,10 @@ class MacroController(QWidget):
     def closeEvent(self, event):
         try:
             logger.info("Shutting down application")
+            # Stop continuous compensation first
+            self.worker.set_left_button_state(False)
+            self.active_event.clear()
+            # Then stop all threads
             self.worker.stop()
             self.mouse_listener.stop()
             self.keyboard_listener.stop()
