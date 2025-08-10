@@ -53,6 +53,7 @@ class Preset:
     move_x: float
     move_y: float
     move_z: float
+    compensation_interval: float = 50.0  # Default 50ms interval
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,6 +65,7 @@ class Preset:
             move_x=float(d.get("move_x", 0.0)),
             move_y=float(d.get("move_y", 0.0)),
             move_z=float(d.get("move_z", 0.0)),
+            compensation_interval=float(d.get("compensation_interval", 50.0)),
         )
 
 
@@ -82,37 +84,36 @@ class CompensatorWorker(QThread):
         self._accum_z = 0.0
         self.get_crouch_factor = crouch_factor_getter
         self.preset_lock = Lock()
-        self.shot_fired = False  # Flag to track when a shot is fired
-        self.last_shot_time = 0  # Track time of last shot
+        self.left_button_held = False  # Track if left mouse button is held down
+        self.compensation_interval = 0.05  # 50ms interval for automatic weapon fire rates
 
     def set_preset(self, preset: Preset):
         with self.preset_lock:
             self.preset = preset
+
+    def set_left_button_state(self, pressed: bool):
+        """Update the left mouse button state for continuous compensation"""
+        self.left_button_held = pressed
 
     def stop(self):
         self._stop_event.set()
         self.active_event.clear()
         if not self.wait(2000):  # Wait up to 2 seconds for thread to finish
             logger.warning("Worker thread did not terminate gracefully")
-            
-    def trigger_shot(self):
-        """Called when a shot is fired to apply compensation"""
-        self.shot_fired = True
-        self.last_shot_time = time.time()
 
     def run(self):
-        step_sleep = 0.005  # Faster update rate for more responsive compensation
+        step_sleep = 0.005  # Small sleep to prevent excessive CPU usage
         logger.info("Compensator worker started")
         try:
             while not self._stop_event.is_set():
                 try:
-                    if self.active_event.is_set() and self.preset and self.shot_fired:
-                        # Apply recoil compensation when a shot is fired
+                    if (self.active_event.is_set() and self.preset and self.left_button_held):
+                        # Apply continuous recoil compensation while left mouse button is held
                         factor = self.get_crouch_factor() if self.crouch_event.is_set() else 1.0
                         
                         # Use lock when accessing preset
                         with self.preset_lock:
-                            # Apply compensation all at once for immediate effect
+                            # Apply compensation continuously
                             self._accum_x += self.preset.move_x * factor
                             self._accum_y += self.preset.move_y * factor
                             self._accum_z += self.preset.move_z * factor
@@ -135,11 +136,11 @@ class CompensatorWorker(QThread):
                         if move_z_int != 0:
                             scroll_mouse(move_z_int)
                         
-                        # Reset shot flag after a short time (allows for rapid fire)
-                        if time.time() - self.last_shot_time > 0.05:
-                            self.shot_fired = False
-                    
-                    time.sleep(step_sleep)
+                        # Wait for the compensation interval before next application
+                        time.sleep(self.compensation_interval)
+                    else:
+                        # When not compensating, use smaller sleep to be responsive
+                        time.sleep(step_sleep)
                 except Exception as e:
                     logger.error(f"Error in worker loop: {str(e)}")
                     self.error.emit(f"Worker error: {str(e)}")
@@ -410,6 +411,21 @@ class MacroController(QWidget):
         z_layout.addWidget(self.move_z_spin)
         recoil_layout.addLayout(z_layout)
         
+        # Compensation interval
+        interval_layout = QHBoxLayout()
+        self.interval_label = QLabel("Compensation Interval (ms):")
+        self.interval_label.setFixedWidth(200)
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(10.0, 500.0)
+        self.interval_spin.setDecimals(0)
+        self.interval_spin.setSingleStep(10.0)
+        self.interval_spin.setValue(50.0)  # Default 50ms for typical automatic weapons
+        self.interval_spin.setFixedWidth(120)
+        self.interval_spin.setSuffix(" ms")
+        interval_layout.addWidget(self.interval_label)
+        interval_layout.addWidget(self.interval_spin)
+        recoil_layout.addLayout(interval_layout)
+        
         recoil_group.setLayout(recoil_layout)
         
         # Crouch settings group
@@ -468,7 +484,7 @@ class MacroController(QWidget):
         presets_group.setLayout(presets_layout)
         
         # Enable button
-        self.enable_btn = QPushButton("Enable Recoil Compensation")
+        self.enable_btn = QPushButton("Enable Continuous Compensation")
         self.enable_btn.setCheckable(True)
         self.enable_btn.setChecked(True)
         self.enable_btn.setStyleSheet("""
@@ -492,8 +508,8 @@ class MacroController(QWidget):
             }
         """)
         
-        # Message for shot detection
-        self.shot_info = QLabel("Click to fire - compensation applied with each shot")
+        # Message for continuous compensation
+        self.shot_info = QLabel("Hold left mouse button for continuous compensation")
         self.shot_info.setAlignment(Qt.AlignCenter)
         self.shot_info.setStyleSheet("font-style: italic; color: #AAAAAA;")
         
@@ -536,7 +552,7 @@ class MacroController(QWidget):
             self.mouse_listener.start()
             self.keyboard_listener.start()
             self.connect_signals()
-            self.status_label.setText("Status: Ready")
+            self.status_label.setText("Ready (hold left mouse for compensation)")
             # Set default crouch key
             self.crouch_key = self.crouch_key_edit.text().strip().lower()
             logger.info("Application initialized")
@@ -604,6 +620,7 @@ class MacroController(QWidget):
                 move_x=self.move_x_spin.value(),
                 move_y=self.move_y_spin.value(),
                 move_z=self.move_z_spin.value(),
+                compensation_interval=self.interval_spin.value(),
             )
             
             self.presets[name] = p
@@ -631,6 +648,7 @@ class MacroController(QWidget):
             self.move_x_spin.setValue(p.move_x)
             self.move_y_spin.setValue(p.move_y)
             self.move_z_spin.setValue(p.move_z)
+            self.interval_spin.setValue(p.compensation_interval)
                 
             self.status_label.setText(f"Loaded preset '{name}'")
             logger.info(f"Loaded preset: {name}")
@@ -659,31 +677,31 @@ class MacroController(QWidget):
         try:
             if button == mouse.Button.left:
                 self.left_pressed = pressed
-                if pressed and self.enable_btn.isChecked():
-                    # Apply compensation on each shot (left click)
-                    self.apply_compensation()
+                if self.enable_btn.isChecked():
+                    # Update worker with button state for continuous compensation
+                    self.update_compensation_state(pressed)
                     
             elif button == mouse.Button.right:
                 self.right_pressed = pressed
                 
             # Update status label
             if self.enable_btn.isChecked():
-                if pressed:
+                if pressed and button == mouse.Button.left:
                     self.status_label.setObjectName("statusActive")
-                    self.status_label.setText("Compensation active")
+                    self.status_label.setText("Continuous compensation active")
                     self.status_label.style().unpolish(self.status_label)
                     self.status_label.style().polish(self.status_label)
-                else:
+                elif not pressed and button == mouse.Button.left:
                     self.status_label.setObjectName("statusInactive")
-                    self.status_label.setText("Ready (waiting for next shot)")
+                    self.status_label.setText("Ready (hold left mouse for compensation)")
                     self.status_label.style().unpolish(self.status_label)
                     self.status_label.style().polish(self.status_label)
                     
         except Exception as e:
             logger.error(f"Mouse click error: {str(e)}")
             
-    def apply_compensation(self):
-        """Apply recoil compensation for a single shot"""
+    def update_compensation_state(self, left_pressed: bool):
+        """Update compensation state for continuous operation"""
         try:
             if not self.enable_btn.isChecked():
                 return
@@ -694,15 +712,26 @@ class MacroController(QWidget):
                 move_x=self.move_x_spin.value(),
                 move_y=self.move_y_spin.value(),
                 move_z=self.move_z_spin.value(),
+                compensation_interval=self.interval_spin.value(),
             )
             
-            # Set active and trigger compensation
+            # Update worker with current preset, button state, and interval
             self.worker.set_preset(p)
-            self.active_event.set()
-            self.worker.trigger_shot()
+            self.worker.set_left_button_state(left_pressed)
+            # Convert interval from milliseconds to seconds
+            self.worker.compensation_interval = self.interval_spin.value() / 1000.0
+            
+            if left_pressed:
+                self.active_event.set()
+            else:
+                self.active_event.clear()
             
         except Exception as e:
-            logger.error(f"Compensation error: {str(e)}")
+            logger.error(f"Compensation state update error: {str(e)}")
+
+    def apply_compensation(self):
+        """Legacy method kept for compatibility - now redirects to state update"""
+        self.update_compensation_state(self.left_pressed)
 
     # ---------- Keyboard Listener ----------
     def on_key_action(self, key, pressed):
@@ -757,12 +786,15 @@ class MacroController(QWidget):
     def on_toggle_enabled(self, enabled: bool):
         try:
             if enabled:
-                self.status_label.setText("Compensation Enabled")
+                self.status_label.setText("Continuous Compensation Enabled")
                 self.enable_btn.setText("Disable Compensation")
             else:
                 self.status_label.setText("Compensation Disabled")
-                self.enable_btn.setText("Enable Compensation")
+                self.enable_btn.setText("Enable Continuous Compensation")
                 self.active_event.clear()
+                # Clear worker state when disabled
+                if hasattr(self.worker, 'set_left_button_state'):
+                    self.worker.set_left_button_state(False)
         except Exception as e:
             logger.error(f"Toggle error: {str(e)}")
 
